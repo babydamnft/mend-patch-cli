@@ -7,7 +7,7 @@
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
 
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname } from 'node:path';
 
 const FORMATS = ['auto', 'unified', 'search-replace', 'v4a', 'json'];
@@ -40,6 +40,18 @@ function safe(p: string): boolean {
   return p !== '' && !p.startsWith('/') && !p.includes('\\') && p.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
 }
 
+function assertNoSymlink(path: string): void {
+  let current = '';
+  for (const segment of path.split('/')) {
+    current = current === '' ? segment : `${current}/${segment}`;
+    try {
+      if (lstatSync(current).isSymbolicLink()) throw new Fail('unsafe', path);
+    } catch (error) {
+      if (error instanceof Fail) throw error;
+    }
+  }
+}
+
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
   private readonly orig = new Map<string, string | null>();
@@ -47,6 +59,7 @@ class Tree {
   readonly moves = new Map<string, string>();
   original(p: string): string | null {
     if (!this.orig.has(p)) {
+      assertNoSymlink(p);
       let v: string | null = null;
       try {
         if (statSync(p).isFile()) v = readFileSync(p, 'utf8');
@@ -194,7 +207,7 @@ function unifiedEdits(lines: string[], strict = false): Edit[] {
       }
     }
   }
-  return sections.filter((s) => s.hunks.length > 0 || s.create || s.deletion || s.oldPath !== s.newPath).map((s) => (tree: Tree): void => {
+  return sections.map((s) => (tree: Tree): void => {
     const creation = s.create || s.oldPath === '/dev/null';
     const deletion = s.deletion || s.newPath === '/dev/null';
     if (creation) {
@@ -324,6 +337,7 @@ function v4aEdits(lines: string[], strict = false): Edit[] {
         const prefixChar = line[0];
         if (line !== '' && prefixChar !== ' ' && prefixChar !== '-' && prefixChar !== '+') throw new Exit2(`error: parse ${bodyLine(k)}`);
         if (chunk === null) {
+          if (section.chunks.length > 0) throw new Exit2(`error: parse ${bodyLine(k)}`);
           chunk = { anchor: '', eof: false, oldLines: [], newLines: [], contextAt: [] };
           section.chunks.push(chunk);
         }
@@ -356,7 +370,7 @@ function v4aEdits(lines: string[], strict = false): Edit[] {
       tree.now.set(s.path, null);
       return;
     }
-    if (destination !== s.path && tree.get(destination) !== null) throw new Fail('exists', destination);
+    if (s.moveTo !== null && tree.get(destination) !== null) throw new Fail('exists', destination);
     const state = fileLines(before);
     let cursor = 0;
     for (const chunk of s.chunks) {
@@ -555,6 +569,76 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   return edits;
 }
 
+type WriteOperation = { path: string; now: string | null };
+
+function statOrNull(path: string): ReturnType<typeof statSync> | null {
+  try {
+    return statSync(path);
+  } catch {
+    return null;
+  }
+}
+
+/** Reject final trees that cannot be realized, before the first filesystem write. */
+function writeOperations(tree: Tree): WriteOperation[] {
+  const operations = [...tree.now.entries()]
+    .filter(([p, now]) => tree.original(p) !== now)
+    .map(([path, now]) => ({ path, now }));
+  for (const { path, now } of operations) {
+    assertNoSymlink(path);
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i += 1) {
+      const parent = parts.slice(0, i).join('/');
+      if (tree.now.has(parent)) {
+        if (tree.now.get(parent) !== null) throw new Error(`mend: file-directory conflict at ${parent}`);
+      } else {
+        const st = statOrNull(parent);
+        if (st !== null && !st.isDirectory()) throw new Error(`mend: file-directory conflict at ${parent}`);
+      }
+    }
+    if (now !== null) {
+      const st = statOrNull(path);
+      if (st !== null && !st.isFile()) throw new Error(`mend: not a file at ${path}`);
+    }
+  }
+  return operations.sort((a, b) => {
+    if ((a.now === null) !== (b.now === null)) return a.now === null ? -1 : 1;
+    const depthA = a.path.split('/').length;
+    const depthB = b.path.split('/').length;
+    return a.now === null ? depthB - depthA : depthA - depthB;
+  });
+}
+
+/** Apply a validated tree, restoring already-touched paths if any write fails. */
+function commitWrites(tree: Tree, operations: WriteOperation[]): void {
+  const attempted: WriteOperation[] = [];
+  try {
+    for (const operation of operations) {
+      const { path, now } = operation;
+      attempted.push(operation);
+      if (now === null) rmSync(path, { force: true });
+      else {
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, now);
+      }
+    }
+  } catch (error) {
+    for (const { path } of attempted.reverse()) {
+      const before = tree.original(path);
+      try {
+        if (before === null) rmSync(path, { force: true });
+        else {
+          mkdirSync(dirname(path), { recursive: true });
+          writeFileSync(path, before);
+        }
+      } catch {
+        // Keep the original failure; every restoration is attempted.
+      }
+    }
+    throw error;
+  }
+}
+
 function run(args: string[]): { code: number; out: string[] } {
   let format: string | null = null;
   let check = false;
@@ -621,16 +705,8 @@ function run(args: string[]): { code: number; out: string[] } {
     entries.push({ path: p, row: `${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}` });
   }
   entries.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
-  if (!check) {
-    for (const [p, now] of tree.now) {
-      if (tree.original(p) === now) continue;
-      if (now === null) rmSync(p, { force: true });
-      else {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, now);
-      }
-    }
-  }
+  const writes = writeOperations(tree);
+  if (!check) commitWrites(tree, writes);
   const rows = entries.map((e) => e.row);
   return { code: 0, out: [...rows, `ok: ${rows.length} ${rows.length === 1 ? 'file' : 'files'}`] };
 }
